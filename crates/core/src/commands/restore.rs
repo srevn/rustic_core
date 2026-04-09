@@ -4,16 +4,11 @@ use derive_setters::Setters;
 use jiff::Timestamp;
 use log::{debug, error, info, trace, warn};
 
-use std::{
-    cmp::Ordering,
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
 
-use ignore::{DirEntry, WalkBuilder};
 use itertools::Itertools;
 use rayon::ThreadPoolBuilder;
+use walkdir::WalkDir;
 
 use crate::{
     backend::{
@@ -157,21 +152,20 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
     let mut stats = RestoreStats::default();
     let mut restore_infos = RestorePlan::default();
     let mut additional_existing = false;
-    let mut removed_dir = None;
 
-    let mut process_existing = |entry: &DirEntry| -> RusticResult<_> {
+    let mut process_existing = |entry: &walkdir::DirEntry| -> RusticResult<_> {
         if entry.depth() == 0 {
             // don't process the root dir which should be existing
             return Ok(());
         }
 
         debug!("additional {}", entry.path().display());
-        if entry.file_type().unwrap().is_dir() {
+        if entry.file_type().is_dir() {
             stats.dirs.additional += 1;
         } else {
             stats.files.additional += 1;
         }
-        match (opts.delete, dry_run, entry.file_type().unwrap().is_dir()) {
+        match (opts.delete, dry_run, entry.file_type().is_dir()) {
             (true, true, true) => {
                 info!(
                     "would have removed the additional dir: {}",
@@ -185,17 +179,8 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
                 );
             }
             (true, false, true) => {
-                let path = entry.path();
-                match &removed_dir {
-                    Some(dir) if path.starts_with(dir) => {}
-                    _ => match dest.remove_dir(path) {
-                        Ok(()) => {
-                            removed_dir = Some(path.to_path_buf());
-                        }
-                        Err(err) => {
-                            error!("error removing {}: {err}", path.display());
-                        }
-                    },
+                if let Err(err) = dest.remove_dir(entry.path()) {
+                    error!("error removing {}: {err}", entry.path().display());
                 }
             }
             (true, false, false) => {
@@ -266,20 +251,21 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
         Ok(())
     };
 
-    let mut dst_iter = WalkBuilder::new(dest_path)
+    let mut walker = WalkDir::new(&dest_path)
         .follow_links(false)
-        .hidden(false)
-        .ignore(false)
-        .sort_by_file_path(Path::cmp)
-        .build()
-        .inspect(|r| {
-            if let Err(err) = r {
-                error!("Error during collection of files: {err:?}");
-            }
-        })
-        .filter_map(Result::ok);
+        .sort_by_file_name()
+        .into_iter();
 
-    let mut next_dst = dst_iter.next();
+    let next_entry = |walker: &mut walkdir::IntoIter| -> Option<walkdir::DirEntry> {
+        loop {
+            match walker.next()? {
+                Ok(entry) => return Some(entry),
+                Err(err) => error!("Error during collection of files: {err:?}"),
+            }
+        }
+    };
+
+    let mut next_dst = next_entry(&mut walker);
 
     let mut next_node = node_streamer.next().transpose()?;
 
@@ -289,25 +275,37 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
 
             (Some(destination), None) => {
                 process_existing(destination)?;
-                next_dst = dst_iter.next();
+                // don't descend into extra dirs
+                if destination.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                next_dst = next_entry(&mut walker);
             }
             (Some(destination), Some((path, node))) => {
                 match destination.path().cmp(&dest.path(path)) {
                     Ordering::Less => {
                         process_existing(destination)?;
-                        next_dst = dst_iter.next();
+                        // don't descend into extra dirs
+                        if destination.file_type().is_dir() {
+                            walker.skip_current_dir();
+                        }
+                        next_dst = next_entry(&mut walker);
                     }
                     Ordering::Equal => {
                         // process existing node
-                        if (node.is_dir() && !destination.file_type().unwrap().is_dir())
-                            || (node.is_file() && !destination.metadata().unwrap().is_file())
+                        if (node.is_dir() && !destination.file_type().is_dir())
+                            || (node.is_file() && !destination.file_type().is_file())
                             || node.is_special()
                         {
                             // if types do not match, first remove the existing file
                             process_existing(destination)?;
+                            // removed a dir — don't descend into its former children
+                            if destination.file_type().is_dir() {
+                                walker.skip_current_dir();
+                            }
                         }
                         process_node(path, node, true)?;
-                        next_dst = dst_iter.next();
+                        next_dst = next_entry(&mut walker);
                         next_node = node_streamer.next().transpose()?;
                     }
                     Ordering::Greater => {
